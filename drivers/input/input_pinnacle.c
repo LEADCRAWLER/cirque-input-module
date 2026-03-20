@@ -261,9 +261,6 @@ static void pinnacle_send_rel(const struct device *dev, int8_t dx, int8_t dy) {
     const struct pinnacle_config *config = dev->config;
     struct pinnacle_data *data = dev->data;
 
-    pinnacle_clear_status(dev);
-    set_int(dev, true);
-
     bool must_send = false;
 
     uint8_t btn = data->last_btn;
@@ -319,10 +316,6 @@ static void pinnacle_send_abs(const struct device *dev) {
     int16_t x = data->last_x;
     int16_t y = data->last_y;
     int8_t z = data->last_z;
-
-    LOG_DBG("Clearing status bit");
-    pinnacle_clear_status(dev);
-    set_int(dev, true);
 
     uint8_t btn = data->last_btn;
     if (!config->no_taps && (btn || data->btn_cache)) {
@@ -470,6 +463,14 @@ static void pinnacle_work_cb(struct k_work *work) {
     } else {
         pinnacle_report_data_rel(dev);
     }
+
+    // Always clear status and re-enable interrupt, regardless of whether the
+    // report functions above found valid data. Previously this was done inside
+    // pinnacle_send_abs/pinnacle_send_rel, but early-return paths (no SW_DR
+    // flag, 0xFF packet, read error) would skip re-enabling the interrupt,
+    // permanently disabling data-ready notifications.
+    pinnacle_clear_status(dev);
+    set_int(dev, true);
 
     // Adaptive sample rate: only meaningful in modes that track absolute position
     if (config->adaptive_sample_rate && (config->absolute_mode || config->abs_rel_divisor)) {
