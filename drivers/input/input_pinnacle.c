@@ -4,6 +4,7 @@
 #include <zephyr/init.h>
 #include <zephyr/input/input.h>
 #include <zephyr/pm/device.h>
+#include <zephyr/pm/device_runtime.h>
 
 #include <zephyr/logging/log.h>
 
@@ -26,6 +27,11 @@ static int pinnacle_write(const struct device *dev, const uint8_t addr, const ui
 // But for now just have the touch controller emit NUM_ZIDLE_PAD extra idles
 #define NUM_ZIDLE  3
 #define NUM_ZIDLE_PAD 2
+
+// Adaptive sample rate: reduce rate after this many consecutive low-movement samples
+#define PINNACLE_ADAPTIVE_IDLE_THRESHOLD 10
+// Position delta (in Pinnacle units) below which movement is considered "idle"
+#define PINNACLE_ADAPTIVE_MOVE_THRESHOLD 5
 
 #if DT_ANY_INST_ON_BUS_STATUS_OKAY(i2c)
 
@@ -448,6 +454,31 @@ static void pinnacle_work_cb(struct k_work *work) {
     } else {
         pinnacle_report_data_rel(dev);
     }
+
+    // Adaptive sample rate: only meaningful in modes that track absolute position
+    if (config->adaptive_sample_rate && (config->absolute_mode || config->abs_rel_divisor)) {
+        int16_t dx = data->last_x - data->prev_x;
+        int16_t dy = data->last_y - data->prev_y;
+        data->prev_x = data->last_x;
+        data->prev_y = data->last_y;
+
+        if (dx > -PINNACLE_ADAPTIVE_MOVE_THRESHOLD && dx < PINNACLE_ADAPTIVE_MOVE_THRESHOLD &&
+            dy > -PINNACLE_ADAPTIVE_MOVE_THRESHOLD && dy < PINNACLE_ADAPTIVE_MOVE_THRESHOLD) {
+            if (data->activity_counter < PINNACLE_ADAPTIVE_IDLE_THRESHOLD) {
+                data->activity_counter++;
+            }
+            if (data->activity_counter >= PINNACLE_ADAPTIVE_IDLE_THRESHOLD && !data->at_low_rate) {
+                pinnacle_write(dev, PINNACLE_SAMPLE, config->low_sample_rate);
+                data->at_low_rate = true;
+            }
+        } else {
+            data->activity_counter = 0;
+            if (data->at_low_rate) {
+                pinnacle_write(dev, PINNACLE_SAMPLE, config->high_sample_rate);
+                data->at_low_rate = false;
+            }
+        }
+    }
 }
 
 static void pinnacle_gpio_cb(const struct device *port, struct gpio_callback *cb, uint32_t pins) {
@@ -621,10 +652,128 @@ int pinnacle_set_shutdown(const struct device *dev, bool enabled) {
     return ret;
 }
 
+static int pinnacle_set_feed_enable(const struct device *dev, bool enable) {
+    uint8_t feedcfg;
+    int ret = pinnacle_seq_read(dev, PINNACLE_FEED_CFG1, &feedcfg, 1);
+    if (ret < 0) {
+        return ret;
+    }
+    if (enable) {
+        feedcfg |= PINNACLE_FEED_CFG1_EN_FEED;
+    } else {
+        feedcfg &= ~PINNACLE_FEED_CFG1_EN_FEED;
+    }
+    return pinnacle_write(dev, PINNACLE_FEED_CFG1, feedcfg);
+}
+
+// Re-programs all Pinnacle registers from config. Called during init and PM resume.
+// Does not touch one-time init state (GPIO callbacks, work queue, dev pointer).
+static int pinnacle_configure(const struct device *dev) {
+    const struct pinnacle_config *config = dev->config;
+    struct pinnacle_data *data = dev->data;
+    int ret;
+
+    // In pure absolute mode the driver doesn't count z-idle packets for lift
+    // detection, so honour the DT value (default 0) to suppress unnecessary MCU
+    // wakeups. Relative and abs-rel modes need NUM_ZIDLE+pad for lift detection.
+    uint8_t z_idle_count = (config->absolute_mode && !config->abs_rel_divisor)
+                               ? config->idle_packets_count
+                               : (NUM_ZIDLE + NUM_ZIDLE_PAD);
+    ret = pinnacle_write(dev, PINNACLE_Z_IDLE, z_idle_count);
+    if (ret < 0) {
+        LOG_ERR("can't write Z_IDLE %d", ret);
+        return ret;
+    }
+
+    ret = pinnacle_set_adc_tracking_sensitivity(dev);
+    if (ret < 0) {
+        LOG_ERR("Failed to set ADC sensitivity %d", ret);
+        return ret;
+    }
+
+    ret = pinnacle_tune_edge_sensitivity(dev);
+    if (ret < 0) {
+        LOG_ERR("Failed to tune edge sensitivity %d", ret);
+        return ret;
+    }
+
+    ret = pinnacle_force_recalibrate(dev);
+    if (ret < 0) {
+        LOG_ERR("Failed to force recalibration %d", ret);
+        return ret;
+    }
+
+    ret = pinnacle_set_sleep(dev, true);
+    if (ret < 0) {
+        return ret;
+    }
+
+    ret = pinnacle_write(dev, PINNACLE_SLEEP_INTERVAL, config->sleep_interval);
+    if (ret < 0) {
+        LOG_ERR("Failed to write sleep interval %d", ret);
+        return ret;
+    }
+
+    // Restore full sample rate and reset adaptive rate state on every configure
+    if (config->adaptive_sample_rate) {
+        ret = pinnacle_write(dev, PINNACLE_SAMPLE, config->high_sample_rate);
+        if (ret < 0) {
+            LOG_ERR("Failed to write sample rate %d", ret);
+            return ret;
+        }
+        data->at_low_rate = false;
+        data->activity_counter = 0;
+    }
+
+    uint8_t feed_cfg2 = PINNACLE_FEED_CFG2_EN_IM | PINNACLE_FEED_CFG2_EN_BTN_SCRL;
+    if (config->no_taps) {
+        feed_cfg2 |= PINNACLE_FEED_CFG2_DIS_TAP;
+    }
+    if (config->no_secondary_tap) {
+        feed_cfg2 |= PINNACLE_FEED_CFG2_DIS_SEC;
+    }
+    if (config->rotate_90) {
+        feed_cfg2 |= PINNACLE_FEED_CFG2_ROTATE_90;
+    }
+    ret = pinnacle_write(dev, PINNACLE_FEED_CFG2, feed_cfg2);
+    if (ret < 0) {
+        LOG_ERR("can't write FEED_CFG2 %d", ret);
+        return ret;
+    }
+
+    uint8_t feed_cfg1 = PINNACLE_FEED_CFG1_EN_FEED;
+    if (config->absolute_mode || config->abs_rel_divisor) {
+        feed_cfg1 |= PINNACLE_FEED_CFG1_ABS_MODE;
+        LOG_ERR("Using absolute mode");
+    } else {
+        LOG_ERR("Using relative mode");
+    }
+    if (config->x_invert) {
+        feed_cfg1 |= PINNACLE_FEED_CFG1_INV_X;
+    }
+    if (config->y_invert) {
+        feed_cfg1 |= PINNACLE_FEED_CFG1_INV_Y;
+    }
+    ret = pinnacle_write(dev, PINNACLE_FEED_CFG1, feed_cfg1);
+    if (ret < 0) {
+        LOG_ERR("can't write FEED_CFG1 %d", ret);
+    }
+    return ret;
+}
+
 static int pinnacle_init(const struct device *dev) {
     struct pinnacle_data *data = dev->data;
     const struct pinnacle_config *config = dev->config;
     int ret;
+
+    // If a supply GPIO is configured, ensure it drives power on at boot
+    if (config->supply_gpio.port != NULL) {
+        ret = gpio_pin_configure_dt(&config->supply_gpio, GPIO_OUTPUT_ACTIVE);
+        if (ret < 0) {
+            LOG_ERR("Failed to configure supply GPIO: %d", ret);
+            return ret;
+        }
+    }
 
     uint8_t fw_id[2];
     ret = pinnacle_seq_read(dev, PINNACLE_FW_ID, fw_id, 2);
@@ -647,85 +796,10 @@ static int pinnacle_init(const struct device *dev) {
         return ret;
     }
     k_msleep(20);
-    ret = pinnacle_write(dev, PINNACLE_Z_IDLE, NUM_ZIDLE + NUM_ZIDLE_PAD);
-    if (ret < 0) {
-        LOG_ERR("can't write %d", ret);
-        return ret;
-    }
 
-    ret = pinnacle_set_adc_tracking_sensitivity(dev);
-    if (ret < 0) {
-        LOG_ERR("Failed to set ADC sensitivity %d", ret);
-        return ret;
-    }
-
-    ret = pinnacle_tune_edge_sensitivity(dev);
-    if (ret < 0) {
-        LOG_ERR("Failed to tune edge sensitivity %d", ret);
-        return ret;
-    }
-    ret = pinnacle_force_recalibrate(dev);
-    if (ret < 0) {
-        LOG_ERR("Failed to force recalibration %d", ret);
-        return ret;
-    }
-
-    if (config->sleep_en) {
-        ret = pinnacle_set_sleep(dev, true);
-        if (ret < 0) {
-            return ret;
-        }
-    }
-
-    uint8_t packet[1];
-    ret = pinnacle_seq_read(dev, PINNACLE_SLEEP_INTERVAL, packet, 1);
- 
-    if (ret >= 0) {
-        LOG_DBG("Default sleep interval %d", packet[0]);
-    }
-
-    ret = pinnacle_write(dev, PINNACLE_SLEEP_INTERVAL, 255);
-    if (ret <= 0) {
-        LOG_DBG("Failed to update sleep interaval %d", ret);
-    }
-
-    uint8_t feed_cfg2 = PINNACLE_FEED_CFG2_EN_IM | PINNACLE_FEED_CFG2_EN_BTN_SCRL;
-    if (config->no_taps) {
-        feed_cfg2 |= PINNACLE_FEED_CFG2_DIS_TAP;
-    }
-
-    if (config->no_secondary_tap) {
-        feed_cfg2 |= PINNACLE_FEED_CFG2_DIS_SEC;
-    }
-
-    if (config->rotate_90) {
-        feed_cfg2 |= PINNACLE_FEED_CFG2_ROTATE_90;
-    }
-    ret = pinnacle_write(dev, PINNACLE_FEED_CFG2, feed_cfg2);
-    if (ret < 0) {
-        LOG_ERR("can't write %d", ret);
-        return ret;
-    }
-    uint8_t feed_cfg1 = PINNACLE_FEED_CFG1_EN_FEED;
-    if (config->absolute_mode || config->abs_rel_divisor) {
-        feed_cfg1 |= PINNACLE_FEED_CFG1_ABS_MODE;
-        LOG_ERR("Using absolute mode");
-    } else {
-        LOG_ERR("Using relative mode");
-    }
-    if (config->x_invert) {
-        feed_cfg1 |= PINNACLE_FEED_CFG1_INV_X;
-    }
-
-    if (config->y_invert) {
-        feed_cfg1 |= PINNACLE_FEED_CFG1_INV_Y;
-    }
-    if (feed_cfg1) {
-        ret = pinnacle_write(dev, PINNACLE_FEED_CFG1, feed_cfg1);
-    }
-    if (ret < 0) {
-        LOG_ERR("can't write %d", ret);
-        return ret;
+    uint8_t default_sleep_interval;
+    if (pinnacle_seq_read(dev, PINNACLE_SLEEP_INTERVAL, &default_sleep_interval, 1) == 0) {
+        LOG_DBG("Default sleep interval: %d", default_sleep_interval);
     }
 
     data->dev = dev;
@@ -742,9 +816,16 @@ static int pinnacle_init(const struct device *dev) {
 
     k_work_init(&data->work, pinnacle_work_cb);
 
-    pinnacle_write(dev, PINNACLE_FEED_CFG1, feed_cfg1);
+    ret = pinnacle_configure(dev);
+    if (ret < 0) {
+        return ret;
+    }
 
     set_int(dev, true);
+
+#if IS_ENABLED(CONFIG_PM_DEVICE_RUNTIME)
+    pm_device_runtime_enable(dev);
+#endif
 
     return 0;
 }
@@ -752,13 +833,33 @@ static int pinnacle_init(const struct device *dev) {
 #if IS_ENABLED(CONFIG_PM_DEVICE)
 
 static int pinnacle_pm_action(const struct device *dev, enum pm_device_action action) {
+    const struct pinnacle_config *config = dev->config;
+
     switch (action) {
     case PM_DEVICE_ACTION_SUSPEND:
+        pinnacle_set_feed_enable(dev, false);
         pinnacle_set_shutdown(dev, true);
+        // 3.1: Cut VDD entirely if a supply GPIO is wired up (achieves true 0 µA)
+        if (config->supply_gpio.port != NULL) {
+            gpio_pin_set_dt(&config->supply_gpio, 0);
+        }
         return 0;
+
     case PM_DEVICE_ACTION_RESUME:
+        // 3.1: Restore VDD first and allow supply to stabilise
+        if (config->supply_gpio.port != NULL) {
+            gpio_pin_set_dt(&config->supply_gpio, 1);
+            k_msleep(50);
+        }
+        // Clear shutdown; this also re-enables the DR interrupt internally
         pinnacle_set_shutdown(dev, false);
-        return 0;
+        // Wait for POR-equivalent startup time
+        k_msleep(50);
+        // Clear CC/DR flags from wakeup before re-configuring
+        pinnacle_clear_status(dev);
+        // Re-run full register configuration sequence
+        return pinnacle_configure(dev);
+
     default:
         return -ENOTSUP;
     }
@@ -785,6 +886,11 @@ static int pinnacle_pm_action(const struct device *dev, enum pm_device_action ac
         .no_secondary_tap = DT_INST_PROP(n, no_secondary_tap),                                     \
         .absolute_mode = DT_INST_PROP(n, absolute_mode),                                           \
         .abs_rel_divisor = DT_INST_PROP(n, abs_rel_divisor),                                       \
+        .idle_packets_count = DT_INST_PROP(n, idle_packets_count),                                 \
+        .sleep_interval = DT_INST_PROP(n, sleep_interval),                                        \
+        .adaptive_sample_rate = DT_INST_PROP(n, adaptive_sample_rate),                            \
+        .low_sample_rate = DT_INST_PROP(n, low_sample_rate),                                      \
+        .high_sample_rate = DT_INST_PROP(n, high_sample_rate),                                    \
         .absolute_mode_scale_to_width = DT_INST_PROP(n, absolute_mode_scale_to_width),             \
         .absolute_mode_scale_to_height = DT_INST_PROP(n, absolute_mode_scale_to_height),           \
         .absolute_mode_clamp_min_x = DT_INST_PROP(n, absolute_mode_clamp_min_x),                   \
@@ -795,6 +901,7 @@ static int pinnacle_pm_action(const struct device *dev, enum pm_device_action ac
         .y_axis_z_min = DT_INST_PROP_OR(n, y_axis_z_min, 4),                                       \
         .sensitivity = DT_INST_ENUM_IDX_OR(n, sensitivity, PINNACLE_SENSITIVITY_1X),               \
         .dr = GPIO_DT_SPEC_GET_OR(DT_DRV_INST(n), dr_gpios, {}),                                   \
+        .supply_gpio = GPIO_DT_SPEC_GET_OR(DT_DRV_INST(n), supply_gpios, {}),                     \
     };                                                                                             \
     PM_DEVICE_DT_INST_DEFINE(n, pinnacle_pm_action);                                               \
     DEVICE_DT_INST_DEFINE(n, pinnacle_init, PM_DEVICE_DT_INST_GET(n), &pinnacle_data_##n,          \

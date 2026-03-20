@@ -17,6 +17,16 @@ config INPUT_PINNACLE_INIT_PRIORITY
     int "Cirque Pinnacle initialization priority"
     default INPUT_INIT_PRIORITY
 
+config INPUT_PINNACLE_PM
+    bool "Enable power management for Pinnacle trackpad"
+    default y
+    depends on PM_DEVICE
+    help
+      Enable device power management support for the Cirque Pinnacle
+      trackpad. When enabled, the trackpad enters shutdown mode (~0.23 µA)
+      during system suspend. If supply-gpios is configured in the devicetree,
+      VDD is also cut on suspend for true 0 µA draw.
+
 if ZMK_MOUSE
 
 config ZMK_INPUT_PINNACLE_IDLE_SLEEPER

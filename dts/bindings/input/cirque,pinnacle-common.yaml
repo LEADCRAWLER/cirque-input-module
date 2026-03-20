@@ -2,6 +2,13 @@ properties:
   dr-gpios:
     type: phandle-array
     description: Data ready pin for the trackpad
+  supply-gpios:
+    type: phandle-array
+    description: |
+      Optional GPIO controlling the trackpad VDD supply (e.g. a load switch or
+      MOSFET). When configured, power is cut on suspend and restored on resume,
+      achieving true 0 µA draw. The GPIO is driven active (high for active-high
+      switches) when power should be on.
   rotate-90:
     type: boolean
   x-invert:
@@ -34,6 +41,43 @@ properties:
     type: int
     description: If non zero, uses pad in absmode, but sends relative events (and touch press/release)
     default: 0
+  idle-packets-count:
+    type: int
+    default: 0
+    description: |
+      Number of Z=0 (z-idle) packets emitted after a finger lifts. Only applied
+      in pure absolute mode — relative and abs-rel modes require a minimum count
+      for lift detection and ignore this property. Default 0 suppresses all
+      unnecessary MCU wakeups in absolute mode. Maximum 255.
+  sleep-interval:
+    type: int
+    default: 50
+    description: |
+      Sleep mode scan interval written to register 0x0C (Sleep Interval).
+      Higher values increase the time between touch scans during hardware sleep,
+      reducing average current below the 40 µA baseline but increasing wake
+      latency. Default 50 gives ~300ms wake latency. Maximum 255.
+  adaptive-sample-rate:
+    type: boolean
+    description: |
+      Enable adaptive sample rate in absolute or abs-rel mode. When enabled,
+      the driver reduces the sample rate (SAMPLE register 0x09) to low-sample-rate
+      after PINNACLE_ADAPTIVE_IDLE_THRESHOLD consecutive samples with movement
+      below PINNACLE_ADAPTIVE_MOVE_THRESHOLD, and restores high-sample-rate on
+      movement. Only effective in absolute or abs-rel modes.
+  high-sample-rate:
+    type: int
+    default: 100
+    description: |
+      Full-speed sample rate (samples/sec) used during active touch movement.
+      Written to register 0x09. Default 100 matches the Pinnacle power-on default.
+  low-sample-rate:
+    type: int
+    default: 25
+    description: |
+      Reduced sample rate (samples/sec) used when touch movement is below the
+      adaptive threshold. Written to register 0x09 during idle periods to reduce
+      Active-mode current.
   absolute-mode-scale-to-width:
     type: int
     default: 1024
