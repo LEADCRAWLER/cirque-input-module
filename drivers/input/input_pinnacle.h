@@ -1,6 +1,7 @@
 #pragma once
 
 #include <zephyr/device.h>
+#include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/i2c.h>
 #include <zephyr/drivers/spi.h>
 
@@ -80,6 +81,11 @@ struct pinnacle_data {
     int8_t num_z_idle;
     int16_t last_x, last_y; // last abs reading
 
+    // adaptive sample rate tracking
+    int16_t prev_x, prev_y;
+    uint16_t activity_counter;
+    bool at_low_rate;
+
     const struct device *dev;
     struct gpio_callback gpio_cb;
     struct k_work work;
@@ -107,10 +113,16 @@ struct pinnacle_config {
 
     bool rotate_90, sleep_en, no_taps, no_secondary_tap, x_invert, y_invert, absolute_mode;
     uint8_t abs_rel_divisor;
+    uint8_t idle_packets_count;
+    uint8_t sleep_interval;
+    bool adaptive_sample_rate;
+    uint8_t low_sample_rate;
+    uint8_t high_sample_rate;
     enum pinnacle_sensitivity sensitivity;
     uint8_t x_axis_z_min, y_axis_z_min;
     uint16_t absolute_mode_scale_to_width, absolute_mode_scale_to_height, absolute_mode_clamp_min_x, absolute_mode_clamp_max_x, absolute_mode_clamp_min_y, absolute_mode_clamp_max_y;
     const struct gpio_dt_spec dr;
+    const struct gpio_dt_spec supply_gpio;
 };
 
 int pinnacle_set_sleep(const struct device *dev, bool enabled);
