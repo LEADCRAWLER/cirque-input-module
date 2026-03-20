@@ -450,6 +450,17 @@ static void pinnacle_work_cb(struct k_work *work) {
     // flag, 0xFF packet, read error) would skip re-enabling the interrupt,
     // permanently disabling data-ready notifications.
     pinnacle_clear_status(dev);
+
+    // Guard: if DR is still asserted after clearing status, the device is in
+    // a bad state (e.g. woke from shutdown before oscillator stabilized).
+    // Do NOT re-enable the level-triggered interrupt — it would re-fire
+    // immediately, creating an infinite loop that starves the system workqueue
+    // and blocks all processing including keyboard key events.
+    if (gpio_pin_get_dt(&config->dr)) {
+        LOG_ERR("DR still asserted after status clear -- disabling interrupt");
+        return;
+    }
+
     set_int(dev, true);
 
     // Adaptive sample rate: only meaningful in modes that track absolute position
@@ -608,10 +619,10 @@ int pinnacle_set_shutdown(const struct device *dev, bool enabled) {
     LOG_DBG("Setting shutdown: %s", (enabled ? "on" : "off"));
 
     if(enabled) {
-        // interrupt pin might have bogus asserts in shtdown so disable ints here
-        // FIXME if this is in things are fucked later
+        // Disable interrupt before entering shutdown — the DR pin may produce
+        // spurious assertions while the oscillator is stopping.
         set_int(dev, false);
-        }
+    }
 
     WRITE_BIT(sys_cfg, PINNACLE_SYS_CFG_SHUTDOWN_BIT, enabled ? 1 : 0);
 
