@@ -664,7 +664,7 @@ int pinnacle_set_shutdown(const struct device *dev, bool enabled) {
     }
 
     if (!enabled) {
-        // pinnacle_clear_status(dev); // clear any spurious ints on wake
+        pinnacle_clear_status(dev);
         ret = set_int(dev, true);
     }
     else {
@@ -883,31 +883,56 @@ static int pinnacle_pm_action(const struct device *dev, enum pm_device_action ac
 
     case PM_DEVICE_ACTION_RESUME: {
         int ret;
-        // Restore VDD first and allow supply to stabilise
+
         if (config->supply_gpio.port != NULL) {
+            // Power was gated — restore VDD and wait for POR
             gpio_pin_set_dt(&config->supply_gpio, 1);
             k_msleep(50);
+        } else {
+            // Device is in shutdown (not power-gated). Clear shutdown
+            // bit directly so the oscillator starts, then wait for
+            // startup before issuing the software reset below.
+            ret = pinnacle_write(dev, PINNACLE_SYS_CFG, 0x00);
+            if (ret < 0) {
+                LOG_ERR("Failed to clear shutdown: %d", ret);
+                return ret;
+            }
+            k_msleep(10);
         }
-        // Clear shutdown so the device accepts register writes
-        pinnacle_set_shutdown(dev, false);
-        k_msleep(10);
 
-        // Perform a full software reset matching the init sequence.
-        // This ensures all registers return to known defaults before
-        // pinnacle_configure() re-programs them.
-        pinnacle_write(dev, PINNACLE_STATUS1, 0);
+        // Software reset — matches init sequence (lines 822–834).
+        // Restores all registers to POR defaults (also clears shutdown
+        // bit as a side-effect in the power-gated path).
+        ret = pinnacle_write(dev, PINNACLE_STATUS1, 0);
+        if (ret < 0) {
+            LOG_ERR("Resume: failed to clear STATUS1: %d", ret);
+            return ret;
+        }
         k_usleep(50);
-        pinnacle_write(dev, PINNACLE_SYS_CFG, PINNACLE_SYS_CFG_RESET);
+        ret = pinnacle_write(dev, PINNACLE_SYS_CFG, PINNACLE_SYS_CFG_RESET);
+        if (ret < 0) {
+            LOG_ERR("Resume: failed to issue reset: %d", ret);
+            return ret;
+        }
         k_msleep(20);
+
+        // Verify device is alive (matches init FW ID check)
+        uint8_t fw_id[2];
+        ret = pinnacle_seq_read(dev, PINNACLE_FW_ID, fw_id, 2);
+        if (ret < 0) {
+            LOG_ERR("Resume: device not responding after reset: %d", ret);
+            return ret;
+        }
+        LOG_DBG("Resume: FW ID 0x%02x, Version 0x%02x", fw_id[0], fw_id[1]);
 
         pinnacle_clear_status(dev);
 
-        // Re-run full register configuration sequence
         ret = pinnacle_configure(dev);
         if (ret < 0) {
             LOG_ERR("Failed to configure device on resume: %d", ret);
             return ret;
         }
+
         // Ensure interrupts are enabled after configure, matching init.
         // pinnacle_configure() uses ERA read/write which toggle interrupts
         // internally; if any ERA op partially failed, interrupts could be
