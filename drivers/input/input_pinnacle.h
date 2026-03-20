@@ -111,10 +111,11 @@ struct pinnacle_config {
     pinnacle_seq_read_t seq_read;
     pinnacle_write_t write;
 
-    bool rotate_90, sleep_en, no_taps, no_secondary_tap, x_invert, y_invert, absolute_mode;
+    bool rotate_90, sleep_en, no_taps, no_secondary_tap, no_glide_extend, no_scroll, x_invert, y_invert, absolute_mode;
     uint8_t abs_rel_divisor;
     uint8_t idle_packets_count;
     uint8_t sleep_interval;
+    uint8_t sleep_timer;
     bool adaptive_sample_rate;
     uint8_t low_sample_rate;
     uint8_t high_sample_rate;

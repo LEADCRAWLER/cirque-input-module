@@ -355,14 +355,6 @@ static void pinnacle_send_abs(const struct device *dev) {
 static int pinnacle_read_abs(const struct device *dev) {
     uint8_t packet[6];
     int ret;
-    ret = pinnacle_seq_read(dev, PINNACLE_STATUS1, packet, 1);
-    if (ret < 0) {
-        LOG_ERR("read status: %d", ret);
-        return ret;
-    }
-    if (!(packet[0] & PINNACLE_STATUS1_SW_DR)) {
-        return -1;
-    }
     ret = pinnacle_seq_read(dev, PINNACLE_2_2_PACKET0, packet, 6);
     if (ret < 0) {
         LOG_ERR("read packet: %d", ret);
@@ -412,18 +404,6 @@ static void pinnacle_report_data_abs_rel(const struct device *dev) {
 static void pinnacle_report_data_rel(const struct device *dev) {
     uint8_t packet[3];
     int ret;
-    ret = pinnacle_seq_read(dev, PINNACLE_STATUS1, packet, 1);
-    if (ret < 0) {
-        LOG_ERR("read status: %d", ret);
-        return;
-    }
-
-    LOG_HEXDUMP_DBG(packet, 1, "Pinnacle Status1");
-
-    // Ignore 0xFF packets that indicate communcation failure, or if SW_DR isn't asserted
-    if (packet[0] == 0xFF || !(packet[0] & PINNACLE_STATUS1_SW_DR)) {
-        return;
-    }
     ret = pinnacle_seq_read(dev, PINNACLE_2_2_PACKET0, packet, 3);
     if (ret < 0) {
         LOG_ERR("read packet: %d", ret);
@@ -525,24 +505,6 @@ static int pinnacle_tune_edge_sensitivity(const struct device *dev) {
     const struct pinnacle_config *config = dev->config;
     int ret;
 
-    uint8_t x_val;
-    ret = pinnacle_era_read(dev, PINNACLE_ERA_REG_X_AXIS_WIDE_Z_MIN, &x_val);
-    if (ret < 0) {
-        LOG_WRN("Failed to read X val");
-        return ret;
-    }
-
-    LOG_WRN("X val: %d", x_val);
-
-    uint8_t y_val;
-    ret = pinnacle_era_read(dev, PINNACLE_ERA_REG_Y_AXIS_WIDE_Z_MIN, &y_val);
-    if (ret < 0) {
-        LOG_WRN("Failed to read Y val");
-        return ret;
-    }
-
-    LOG_WRN("Y val: %d", y_val);
-
     ret = pinnacle_era_write(dev, PINNACLE_ERA_REG_X_AXIS_WIDE_Z_MIN, config->x_axis_z_min);
     if (ret < 0) {
         LOG_ERR("Failed to set X-Axis Min-Z %d", ret);
@@ -571,10 +533,6 @@ static int pinnacle_set_adc_tracking_sensitivity(const struct device *dev) {
     ret = pinnacle_era_write(dev, PINNACLE_ERA_REG_TRACKING_ADC_CONFIG, val);
     if (ret < 0) {
         LOG_ERR("Failed to set ADC sensitivity %d", ret);
-    }
-    ret = pinnacle_era_read(dev, PINNACLE_ERA_REG_TRACKING_ADC_CONFIG, &val);
-    if (ret < 0) {
-        LOG_ERR("Failed to get ADC sensitivity %d", ret);
     }
 
     return ret;
@@ -667,14 +625,6 @@ int pinnacle_set_shutdown(const struct device *dev, bool enabled) {
         pinnacle_clear_status(dev);
         ret = set_int(dev, true);
     }
-    else {
-        ret = pinnacle_seq_read(dev, PINNACLE_SYS_CFG, &sys_cfg, 1);
-        if (ret < 0) {
-            LOG_ERR("can't read sys config %d", ret);
-            return ret;
-        }
-        LOG_DBG("Shutdown readback: %s", (sys_cfg & PINNACLE_SYS_CFG_SHUTDOWN) ? "on" : "off");
-    }
 
     return ret;
 }
@@ -750,6 +700,12 @@ static int pinnacle_configure(const struct device *dev) {
         return ret;
     }
 
+    ret = pinnacle_write(dev, PINNACLE_SLEEP_TIMER, config->sleep_timer);
+    if (ret < 0) {
+        LOG_ERR("Failed to write sleep timer %d", ret);
+        return ret;
+    }
+
     // Restore full sample rate and reset adaptive rate state on every configure
     if (config->adaptive_sample_rate) {
         ret = pinnacle_write(dev, PINNACLE_SAMPLE, config->high_sample_rate);
@@ -768,6 +724,12 @@ static int pinnacle_configure(const struct device *dev) {
     if (config->no_secondary_tap) {
         feed_cfg2 |= PINNACLE_FEED_CFG2_DIS_SEC;
     }
+    if (config->no_glide_extend) {
+        feed_cfg2 |= PINNACLE_FEED_CFG2_DIS_GE;
+    }
+    if (config->no_scroll) {
+        feed_cfg2 |= PINNACLE_FEED_CFG2_DIS_SCRL;
+    }
     if (config->rotate_90) {
         feed_cfg2 |= PINNACLE_FEED_CFG2_ROTATE_90;
     }
@@ -780,9 +742,9 @@ static int pinnacle_configure(const struct device *dev) {
     uint8_t feed_cfg1 = PINNACLE_FEED_CFG1_EN_FEED;
     if (config->absolute_mode || config->abs_rel_divisor) {
         feed_cfg1 |= PINNACLE_FEED_CFG1_ABS_MODE;
-        LOG_ERR("Using absolute mode");
+        LOG_DBG("Using absolute mode");
     } else {
-        LOG_ERR("Using relative mode");
+        LOG_DBG("Using relative mode");
     }
     if (config->x_invert) {
         feed_cfg1 |= PINNACLE_FEED_CFG1_INV_X;
@@ -965,10 +927,13 @@ static int pinnacle_pm_action(const struct device *dev, enum pm_device_action ac
         .sleep_en = DT_INST_PROP(n, sleep),                                                        \
         .no_taps = DT_INST_PROP(n, no_taps),                                                       \
         .no_secondary_tap = DT_INST_PROP(n, no_secondary_tap),                                     \
+        .no_glide_extend = DT_INST_PROP(n, no_glide_extend),                                      \
+        .no_scroll = DT_INST_PROP(n, no_scroll),                                                   \
         .absolute_mode = DT_INST_PROP(n, absolute_mode),                                           \
         .abs_rel_divisor = DT_INST_PROP(n, abs_rel_divisor),                                       \
         .idle_packets_count = DT_INST_PROP(n, idle_packets_count),                                 \
         .sleep_interval = DT_INST_PROP(n, sleep_interval),                                        \
+        .sleep_timer = DT_INST_PROP(n, sleep_timer),                                              \
         .adaptive_sample_rate = DT_INST_PROP(n, adaptive_sample_rate),                            \
         .low_sample_rate = DT_INST_PROP(n, low_sample_rate),                                      \
         .high_sample_rate = DT_INST_PROP(n, high_sample_rate),                                    \

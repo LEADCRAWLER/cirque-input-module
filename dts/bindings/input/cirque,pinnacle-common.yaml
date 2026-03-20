@@ -21,6 +21,18 @@ properties:
     type: boolean
   no-taps:
     type: boolean
+  no-glide-extend:
+    type: boolean
+    description: |
+      Disable GlideExtend gesture detection. GlideExtend keeps the analog
+      front-end active after finger lift to detect glide gestures, consuming
+      extra power. Disable if not needed to save power on every finger lift.
+  no-scroll:
+    type: boolean
+    description: |
+      Disable the Pinnacle's internal scroll detection engine. When the host
+      handles scrolling in software, the on-chip scroll engine is unnecessary
+      overhead. Disabling it reduces continuous processing power.
   sensitivity:
     type: string
     enum:
@@ -57,6 +69,15 @@ properties:
       Higher values increase the time between touch scans during hardware sleep,
       reducing average current below the 40 µA baseline but increasing wake
       latency. Default 50 gives ~300ms wake latency. Maximum 255.
+  sleep-timer:
+    type: int
+    default: 39
+    description: |
+      Sleep mode entry delay written to register 0x0D (Sleep Timer).
+      Controls how quickly the device enters sleep mode after no touch is
+      detected. Lower values enter sleep faster, saving power by reducing
+      time in the 1.7mA idle state. Value is in units of the Sleep Interval
+      period. Default 39 matches the Pinnacle factory default. Maximum 255.
   adaptive-sample-rate:
     type: boolean
     description: |

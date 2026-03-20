@@ -16,6 +16,8 @@ static const struct device *pinnacle_devs[] = {
     DT_FOREACH_STATUS_OKAY(cirque_pinnacle, GET_PINNACLE)
 };
 
+static bool is_shutdown;
+
 static int on_activity_state(const zmk_event_t *eh) {
     struct zmk_activity_state_changed *state_ev = as_zmk_activity_state_changed(eh);
 
@@ -24,10 +26,24 @@ static int on_activity_state(const zmk_event_t *eh) {
         return 0;
     }
 
-    bool sleep = state_ev->state == ZMK_ACTIVITY_ACTIVE ? 0 : 1;
     for (size_t i = 0; i < ARRAY_SIZE(pinnacle_devs); i++) {
-        pinnacle_set_sleep(pinnacle_devs[i], sleep);
+        switch (state_ev->state) {
+        case ZMK_ACTIVITY_ACTIVE:
+            if (is_shutdown) {
+                pinnacle_set_shutdown(pinnacle_devs[i], false);
+            }
+            pinnacle_set_sleep(pinnacle_devs[i], false);
+            break;
+        case ZMK_ACTIVITY_IDLE:
+            pinnacle_set_sleep(pinnacle_devs[i], true);
+            break;
+        case ZMK_ACTIVITY_SLEEP:
+            pinnacle_set_shutdown(pinnacle_devs[i], true);
+            break;
+        }
     }
+
+    is_shutdown = (state_ev->state == ZMK_ACTIVITY_SLEEP);
 
     return 0;
 }
