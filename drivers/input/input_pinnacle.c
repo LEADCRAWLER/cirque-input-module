@@ -154,43 +154,50 @@ static int pinnacle_era_read(const struct device *dev, const uint16_t addr, uint
     ret = pinnacle_write(dev, PINNACLE_REG_ERA_HIGH_BYTE, (uint8_t)(addr >> 8));
     if (ret < 0) {
         LOG_ERR("Failed to write ERA high byte (%d)", ret);
-        return -EIO;
+        ret = -EIO;
+        goto out;
     }
 
     ret = pinnacle_write(dev, PINNACLE_REG_ERA_LOW_BYTE, (uint8_t)(addr & 0x00FF));
     if (ret < 0) {
         LOG_ERR("Failed to write ERA low byte (%d)", ret);
-        return -EIO;
+        ret = -EIO;
+        goto out;
     }
 
     ret = pinnacle_write(dev, PINNACLE_REG_ERA_CONTROL, PINNACLE_ERA_CONTROL_READ);
     if (ret < 0) {
         LOG_ERR("Failed to write ERA control (%d)", ret);
-        return -EIO;
+        ret = -EIO;
+        goto out;
     }
 
     uint8_t control_val;
+    int poll_count = 0;
     do {
-
         ret = pinnacle_seq_read(dev, PINNACLE_REG_ERA_CONTROL, &control_val, 1);
         if (ret < 0) {
             LOG_ERR("Failed to read ERA control (%d)", ret);
-            return -EIO;
+            ret = -EIO;
+            goto out;
         }
-
+        if (++poll_count > 100) {
+            LOG_ERR("ERA read timed out (control=0x%02x)", control_val);
+            ret = -ETIMEDOUT;
+            goto out;
+        }
+        k_usleep(50);
     } while (control_val != 0x00);
 
     ret = pinnacle_seq_read(dev, PINNACLE_REG_ERA_VALUE, val, 1);
-
     if (ret < 0) {
         LOG_ERR("Failed to read ERA value (%d)", ret);
-        return -EIO;
+        ret = -EIO;
     }
 
-    ret = pinnacle_clear_status(dev);
-
+out:
+    pinnacle_clear_status(dev);
     set_int(dev, true);
-
     return ret;
 }
 
@@ -202,42 +209,51 @@ static int pinnacle_era_write(const struct device *dev, const uint16_t addr, uin
     ret = pinnacle_write(dev, PINNACLE_REG_ERA_VALUE, val);
     if (ret < 0) {
         LOG_ERR("Failed to write ERA value (%d)", ret);
-        return -EIO;
+        ret = -EIO;
+        goto out;
     }
 
     ret = pinnacle_write(dev, PINNACLE_REG_ERA_HIGH_BYTE, (uint8_t)(addr >> 8));
     if (ret < 0) {
         LOG_ERR("Failed to write ERA high byte (%d)", ret);
-        return -EIO;
+        ret = -EIO;
+        goto out;
     }
 
     ret = pinnacle_write(dev, PINNACLE_REG_ERA_LOW_BYTE, (uint8_t)(addr & 0x00FF));
     if (ret < 0) {
         LOG_ERR("Failed to write ERA low byte (%d)", ret);
-        return -EIO;
+        ret = -EIO;
+        goto out;
     }
 
     ret = pinnacle_write(dev, PINNACLE_REG_ERA_CONTROL, PINNACLE_ERA_CONTROL_WRITE);
     if (ret < 0) {
         LOG_ERR("Failed to write ERA control (%d)", ret);
-        return -EIO;
+        ret = -EIO;
+        goto out;
     }
 
     uint8_t control_val;
+    int poll_count = 0;
     do {
-
         ret = pinnacle_seq_read(dev, PINNACLE_REG_ERA_CONTROL, &control_val, 1);
         if (ret < 0) {
             LOG_ERR("Failed to read ERA control (%d)", ret);
-            return -EIO;
+            ret = -EIO;
+            goto out;
         }
-
+        if (++poll_count > 100) {
+            LOG_ERR("ERA write timed out (control=0x%02x)", control_val);
+            ret = -ETIMEDOUT;
+            goto out;
+        }
+        k_usleep(50);
     } while (control_val != 0x00);
 
-    ret = pinnacle_clear_status(dev);
-
+out:
+    pinnacle_clear_status(dev);
     set_int(dev, true);
-
     return ret;
 }
 
@@ -576,8 +592,18 @@ static int pinnacle_force_recalibrate(const struct device *dev) {
         LOG_ERR("Failed to force calibration %d", ret);
     }
 
+    int poll_count = 0;
     do {
-        pinnacle_seq_read(dev, PINNACLE_CAL_CFG, &val, 1);
+        ret = pinnacle_seq_read(dev, PINNACLE_CAL_CFG, &val, 1);
+        if (ret < 0) {
+            LOG_ERR("Failed to read cal config during recalibration: %d", ret);
+            return ret;
+        }
+        if (++poll_count > 100) {
+            LOG_ERR("Calibration timed out (cal_cfg=0x%02x)", val);
+            return -ETIMEDOUT;
+        }
+        k_msleep(10);
     } while (val & 0x01);
 
     return ret;
@@ -673,6 +699,15 @@ static int pinnacle_configure(const struct device *dev) {
     struct pinnacle_data *data = dev->data;
     int ret;
 
+    // Disable data feed before changing configuration registers to prevent glitches.
+    // After a software reset the feed is already disabled, but this is needed
+    // when pinnacle_configure() is called from the PM resume path.
+    ret = pinnacle_set_feed_enable(dev, false);
+    if (ret < 0) {
+        LOG_ERR("Failed to disable feed for reconfiguration: %d", ret);
+        return ret;
+    }
+
     // In pure absolute mode the driver doesn't count z-idle packets for lift
     // detection, so honour the DT value (default 0) to suppress unnecessary MCU
     // wakeups. Relative and abs-rel modes need NUM_ZIDLE+pad for lift detection.
@@ -703,7 +738,7 @@ static int pinnacle_configure(const struct device *dev) {
         return ret;
     }
 
-    ret = pinnacle_set_sleep(dev, true);
+    ret = pinnacle_set_sleep(dev, config->sleep_en);
     if (ret < 0) {
         return ret;
     }
@@ -845,20 +880,40 @@ static int pinnacle_pm_action(const struct device *dev, enum pm_device_action ac
         }
         return 0;
 
-    case PM_DEVICE_ACTION_RESUME:
-        // 3.1: Restore VDD first and allow supply to stabilise
+    case PM_DEVICE_ACTION_RESUME: {
+        int ret;
+        // Restore VDD first and allow supply to stabilise
         if (config->supply_gpio.port != NULL) {
             gpio_pin_set_dt(&config->supply_gpio, 1);
             k_msleep(50);
         }
-        // Clear shutdown; this also re-enables the DR interrupt internally
+        // Clear shutdown so the device accepts register writes
         pinnacle_set_shutdown(dev, false);
-        // Wait for POR-equivalent startup time
-        k_msleep(50);
-        // Clear CC/DR flags from wakeup before re-configuring
+        k_msleep(10);
+
+        // Perform a full software reset matching the init sequence.
+        // This ensures all registers return to known defaults before
+        // pinnacle_configure() re-programs them.
+        pinnacle_write(dev, PINNACLE_STATUS1, 0);
+        k_usleep(50);
+        pinnacle_write(dev, PINNACLE_SYS_CFG, PINNACLE_SYS_CFG_RESET);
+        k_msleep(20);
+
         pinnacle_clear_status(dev);
+
         // Re-run full register configuration sequence
-        return pinnacle_configure(dev);
+        ret = pinnacle_configure(dev);
+        if (ret < 0) {
+            LOG_ERR("Failed to configure device on resume: %d", ret);
+            return ret;
+        }
+        // Ensure interrupts are enabled after configure, matching init.
+        // pinnacle_configure() uses ERA read/write which toggle interrupts
+        // internally; if any ERA op partially failed, interrupts could be
+        // left disabled.
+        set_int(dev, true);
+        return 0;
+    }
 
     default:
         return -ENOTSUP;
