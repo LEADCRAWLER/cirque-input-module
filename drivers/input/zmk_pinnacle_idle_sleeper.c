@@ -24,9 +24,16 @@ static int on_activity_state(const zmk_event_t *eh) {
         return 0;
     }
 
-    bool sleep = state_ev->state == ZMK_ACTIVITY_ACTIVE ? 0 : 1;
     for (size_t i = 0; i < ARRAY_SIZE(pinnacle_devs); i++) {
-        pinnacle_set_sleep(pinnacle_devs[i], sleep);
+        switch (state_ev->state) {
+        case ZMK_ACTIVITY_ACTIVE:
+            pinnacle_set_sleep(pinnacle_devs[i], false);
+            break;
+        case ZMK_ACTIVITY_IDLE:
+        case ZMK_ACTIVITY_SLEEP:
+            pinnacle_set_sleep(pinnacle_devs[i], true);
+            break;
+        }
     }
 
     return 0;
